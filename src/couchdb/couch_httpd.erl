@@ -203,8 +203,16 @@ handle_request_int(MochiReq, DefaultFun,
         Meth -> couch_util:to_existing_atom(Meth)
     end,
     increment_method_stats(Method1),
+
+    % allow broken HTTP clients to fake a full method vocabulary with an X-HTTP-METHOD-OVERRIDE header
+    MethodOverride = MochiReq:get_primary_header_value("Method-Override"),
+    Method2 = case lists:member(MethodOverride, ["GET", "HEAD", "POST", "PUT", "DELETE", "TRACE", "CONNECT"]) of
+        true -> ?LOG_INFO("MethodOverride: ~s (real method was ~s)", [MethodOverride, Method1]), list_to_atom(MethodOverride);
+       _ -> Method1
+    end,
+
     % alias HEAD to GET as mochiweb takes care of stripping the body
-    Method = case Method1 of
+    Method = case Method2 of
         'HEAD' -> 'GET';
         Other -> Other
     end,
