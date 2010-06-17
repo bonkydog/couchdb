@@ -119,18 +119,47 @@ open_doc(Db, Id, Options) ->
     {ok, #doc{deleted=true}=Doc} ->
         case lists:member(deleted, Options) of
         true ->
-            {ok, Doc};
+            apply_open_options({ok, Doc},Options);
         false ->
             {not_found, deleted}
         end;
     Else ->
-        Else
+        apply_open_options(Else,Options)
+    end.
+
+apply_open_options({ok, Doc},Options) ->
+    apply_open_options2(Doc,Options);
+apply_open_options(Else,_Options) ->
+    Else.
+    
+apply_open_options2(Doc,[]) ->
+    {ok, Doc};
+apply_open_options2(#doc{atts=Atts,revs=Revs}=Doc,
+        [{atts_since, PossibleAncestors}|Rest]) ->
+    RevPos = find_ancestor_rev_pos(Revs, PossibleAncestors),
+    apply_open_options2(Doc#doc{atts=[A#att{data=
+        if AttPos>RevPos -> Data; true -> stub end} 
+        || #att{revpos=AttPos,data=Data}=A <- Atts]}, Rest);
+apply_open_options2(Doc,[_|Rest]) ->
+    apply_open_options2(Doc,Rest).
+
+
+find_ancestor_rev_pos({_, []}, _AttsSinceRevs) ->
+    0;
+find_ancestor_rev_pos(_DocRevs, []) ->
+    0;
+find_ancestor_rev_pos({RevPos, [RevId|Rest]}, AttsSinceRevs) ->
+    case lists:member({RevPos, RevId}, AttsSinceRevs) of
+    true ->
+        RevPos;
+    false ->
+        find_ancestor_rev_pos({RevPos - 1, Rest}, AttsSinceRevs)
     end.
 
 open_doc_revs(Db, Id, Revs, Options) ->
     couch_stats_collector:increment({couchdb, database_reads}),
-    [Result] = open_doc_revs_int(Db, [{Id, Revs}], Options),
-    Result.
+    [{ok, Results}] = open_doc_revs_int(Db, [{Id, Revs}], Options),
+    {ok, [apply_open_options(Result, Options) || Result <- Results]}.
 
 % Each returned result is a list of tuples:
 % {Id, MissingRevs, PossibleAncestors}
@@ -151,9 +180,9 @@ find_missing([{Id, Revs}|RestIdRevs], [{ok, FullInfo} | RestLookupInfo]) ->
         % Find the revs that are possible parents of this rev
         PossibleAncestors =
         lists:foldl(fun({LeafPos, LeafRevId}, Acc) ->
-            % this leaf is a "possible ancenstor" of the missing
+            % this leaf is a "possible ancenstor" of the missing 
             % revs if this LeafPos lessthan any of the missing revs
-            case lists:any(fun({MissingPos, _}) ->
+            case lists:any(fun({MissingPos, _}) -> 
                     LeafPos < MissingPos end, MissingRevs) of
             true ->
                 [{LeafPos, LeafRevId} | Acc];
@@ -261,7 +290,7 @@ check_is_reader(#db{user_ctx=#user_ctx{name=Name,roles=Roles}=UserCtx}=Db) ->
         ReaderRoles = proplists:get_value(<<"roles">>, Readers,[]),
         WithAdminRoles = [<<"_admin">> | ReaderRoles],
         ReaderNames = proplists:get_value(<<"names">>, Readers,[]),
-        case ReaderRoles ++ ReaderNames of
+        case ReaderRoles ++ ReaderNames of 
         [] -> ok; % no readers == public access
         _Else ->
             case WithAdminRoles -- Roles of
@@ -340,7 +369,11 @@ update_doc(Db, Doc, Options, UpdateType) ->
     {ok, [{ok, NewRev}]} ->
         {ok, NewRev};
     {ok, [Error]} ->
-        throw(Error)
+        throw(Error);
+    {ok, []} ->
+        % replication success
+        {Pos, [RevId | _]} = Doc#doc.revs,
+        {ok, {Pos, RevId}}
     end.
 
 update_docs(Db, Docs) ->
@@ -425,15 +458,15 @@ prep_and_validate_update(Db, #doc{id=Id,revs={RevStart, Revs}}=Doc,
 prep_and_validate_updates(_Db, [], [], _AllowConflict, AccPrepped,
         AccFatalErrors) ->
    {AccPrepped, AccFatalErrors};
-prep_and_validate_updates(Db, [DocBucket|RestBuckets], [not_found|RestLookups],
+prep_and_validate_updates(Db, [DocBucket|RestBuckets], [not_found|RestLookups], 
         AllowConflict, AccPrepped, AccErrors) ->
     [#doc{id=Id}|_]=DocBucket,
     % no existing revs are known,
     {PreppedBucket, AccErrors3} = lists:foldl(
-        fun(#doc{revs=Revs}=Doc, {AccBucket, AccErrors2}) ->
+        fun(#doc{revs=Revs}=Doc, {AccBucket, AccErrors2}) ->       
             case couch_doc:has_stubs(Doc) of
             true ->
-                couch_doc:merge_doc(Doc, #doc{}); % will throw exception
+                couch_doc:merge_stubs(Doc, #doc{}); % will throw exception
             false -> ok
             end,
             case Revs of
@@ -471,7 +504,7 @@ prep_and_validate_updates(Db, [DocBucket|RestBuckets],
             end
         end,
         {[], AccErrors}, DocBucket),
-    prep_and_validate_updates(Db, RestBuckets, RestLookups, AllowConflict,
+    prep_and_validate_updates(Db, RestBuckets, RestLookups, AllowConflict, 
             [PreppedBucket | AccPrepped], AccErrors3).
 
 
@@ -487,10 +520,10 @@ prep_and_validate_replicated_updates(Db, [Bucket|RestBuckets], [OldInfo|RestOldI
     case OldInfo of
     not_found ->
         {ValidatedBucket, AccErrors3} = lists:foldl(
-            fun(Doc, {AccPrepped2, AccErrors2}) ->
+            fun(Doc, {AccPrepped2, AccErrors2}) ->                
                 case couch_doc:has_stubs(Doc) of
                 true ->
-                    couch_doc:merge_doc(Doc, #doc{}); % will throw exception
+                    couch_doc:merge_stubs(Doc, #doc{}); % will throw exception
                 false -> ok
                 end,
                 case validate_doc_update(Db, Doc, fun() -> nil end) of
@@ -814,13 +847,14 @@ flush_att(Fd, #att{data=Fun,att_len=AttLen}=Att) when is_function(Fun) ->
 % is present in the request, but there is no Content-MD5
 % trailer, we're free to ignore this inconsistency and
 % pretend that no Content-MD5 exists.
-with_stream(Fd, #att{md5=InMd5,type=Type}=Att, Fun) ->
-    {ok, OutputStream} = case couch_util:compressible_att_type(Type) of
+with_stream(Fd, #att{md5=InMd5,type=Type,encoding=Enc}=Att, Fun) ->
+    {ok, OutputStream} = case (Enc =:= identity) andalso
+        couch_util:compressible_att_type(Type) of
     true ->
         CompLevel = list_to_integer(
             couch_config:get("attachments", "compression_level", "0")
         ),
-        couch_stream:open(Fd, CompLevel);
+        couch_stream:open(Fd, gzip, [{compression_level, CompLevel}]);
     _ ->
         couch_stream:open(Fd)
     end,
@@ -836,12 +870,32 @@ with_stream(Fd, #att{md5=InMd5,type=Type}=Att, Fun) ->
     {StreamInfo, Len, IdentityLen, Md5, IdentityMd5} =
         couch_stream:close(OutputStream),
     check_md5(IdentityMd5, ReqMd5),
+    {AttLen, DiskLen, NewEnc} = case Enc of
+    identity ->
+        case {Md5, IdentityMd5} of
+        {Same, Same} ->
+            {Len, IdentityLen, identity};
+        _ ->
+            {Len, IdentityLen, gzip}
+        end;
+    gzip ->
+        case {Att#att.att_len, Att#att.disk_len} of
+        {AL, DL} when AL =:= undefined orelse DL =:= undefined ->
+            % Compressed attachment uploaded through the standalone API.
+            {Len, Len, gzip};
+        {AL, DL} ->
+            % This case is used for efficient push-replication, where a
+            % compressed attachment is located in the body of multipart
+            % content-type request.
+            {AL, DL, gzip}
+        end
+    end,
     Att#att{
         data={Fd,StreamInfo},
-        att_len=Len,
-        disk_len=IdentityLen,
+        att_len=AttLen,
+        disk_len=DiskLen,
         md5=Md5,
-        comp=(IdentityMd5 =/= Md5)
+        encoding=NewEnc
     }.
 
 
@@ -867,17 +921,18 @@ changes_since(Db, Style, StartSeq, Fun, Acc) ->
 changes_since(Db, Style, StartSeq, Fun, Options, Acc) ->
     Wrapper = fun(DocInfo, _Offset, Acc2) ->
             #doc_info{revs=Revs} = DocInfo,
+            DocInfo2 =
             case Style of
-            main_only ->
-                Infos = [DocInfo];
+            main_only ->    
+                DocInfo;
             all_docs ->
-                % make each rev it's own doc info
-                Infos = [DocInfo#doc_info{revs=[RevInfo]} ||
-                    #rev_info{seq=RevSeq}=RevInfo <- Revs, StartSeq < RevSeq]
+                % remove revs before the seq
+                DocInfo#doc_info{revs=[RevInfo ||
+                    #rev_info{seq=RevSeq}=RevInfo <- Revs, StartSeq < RevSeq]}
             end,
-            Fun(Infos, Acc2)
+            Fun(DocInfo2, Acc2)
         end,
-    {ok, _LastReduction, AccOut} = couch_btree:fold(Db#db.docinfo_by_seq_btree,
+    {ok, _LastReduction, AccOut} = couch_btree:fold(Db#db.docinfo_by_seq_btree, 
         Wrapper, Acc, [{start_key, StartSeq + 1}] ++ Options),
     {ok, AccOut}.
 
@@ -1076,7 +1131,7 @@ make_doc(#db{fd=Fd}=Db, Id, Deleted, Bp, RevisionPath) ->
         {ok, {BodyData0, Atts0}} = read_doc(Db, Bp),
         {BodyData0,
             lists:map(
-                fun({Name,Type,Sp,AttLen,DiskLen,RevPos,Md5,Comp}) ->
+                fun({Name,Type,Sp,AttLen,DiskLen,RevPos,Md5,Enc}) ->
                     #att{name=Name,
                         type=Type,
                         att_len=AttLen,
@@ -1084,7 +1139,18 @@ make_doc(#db{fd=Fd}=Db, Id, Deleted, Bp, RevisionPath) ->
                         md5=Md5,
                         revpos=RevPos,
                         data={Fd,Sp},
-                        comp=Comp};
+                        encoding=
+                            case Enc of
+                            true ->
+                                % 0110 UPGRADE CODE
+                                gzip;
+                            false ->
+                                % 0110 UPGRADE CODE
+                                identity;
+                            _ ->
+                                Enc
+                            end
+                    };
                 ({Name,Type,Sp,AttLen,RevPos,Md5}) ->
                     #att{name=Name,
                         type=Type,

@@ -13,7 +13,7 @@
 -module(couch_httpd).
 -include("couch_db.hrl").
 
--export([start_link/0, stop/0, handle_request/6]).
+-export([start_link/0, stop/0, handle_request/7]).
 
 -export([header_value/2,header_value/3,qs_value/2,qs_value/3,qs/1,path/1,absolute_uri/2,body_length/1]).
 -export([verify_is_server_admin/1,unquote/1,quote/1,recv/2,recv_chunked/4,error_info/1]).
@@ -35,8 +35,13 @@ start_link() ->
 
     BindAddress = couch_config:get("httpd", "bind_address", any),
     Port = couch_config:get("httpd", "port", "5984"),
+    MaxConnections = couch_config:get("httpd", "max_connections", "2048"),
     VirtualHosts = couch_config:get("vhosts"),
-
+    VhostGlobals = re:split(
+        couch_config:get("httpd", "vhost_global_handlers", ""),
+        ", ?",
+        [{return, list}]
+    ),
     DefaultSpec = "{couch_httpd_db, handle_request}",
     DefaultFun = make_arity_1_fun(
         couch_config:get("httpd", "default_handler", DefaultSpec)
@@ -63,7 +68,7 @@ start_link() ->
     Loop = fun(Req)->
         apply(?MODULE, handle_request, [
             Req, DefaultFun, UrlHandlers, DbUrlHandlers, DesignUrlHandlers,
-                VirtualHosts
+                VirtualHosts, VhostGlobals
         ])
     end,
 
@@ -73,7 +78,8 @@ start_link() ->
         {loop, Loop},
         {name, ?MODULE},
         {ip, BindAddress},
-        {port, Port}
+        {port, Port},
+        {max, MaxConnections}
     ]) of
     {ok, MochiPid} -> {ok, MochiPid};
     {error, Reason} ->
@@ -85,6 +91,8 @@ start_link() ->
         fun("httpd", "bind_address") ->
             ?MODULE:stop();
         ("httpd", "port") ->
+            ?MODULE:stop();
+        ("httpd", "max_connections") ->
             ?MODULE:stop();
         ("httpd", "default_handler") ->
             ?MODULE:stop();
@@ -153,19 +161,26 @@ redirect_to_vhost(MochiReq, DefaultFun,
         UrlHandlers, DbUrlHandlers, DesignUrlHandlers).
 
 handle_request(MochiReq, DefaultFun,
-    UrlHandlers, DbUrlHandlers, DesignUrlHandlers, VirtualHosts) ->
+    UrlHandlers, DbUrlHandlers, DesignUrlHandlers, VirtualHosts, VhostGlobals) ->
 
     % grab Host from Req
     Vhost = MochiReq:get_header_value("Host"),
 
     % find Vhost in config
     case proplists:get_value(Vhost, VirtualHosts) of
-        undefined -> % business as usual
+    undefined -> % business as usual
+        handle_request_int(MochiReq, DefaultFun,
+            UrlHandlers, DbUrlHandlers, DesignUrlHandlers);
+    VhostTarget ->
+        case vhost_global(VhostGlobals, MochiReq) of
+        true -> % global handler for vhosts
             handle_request_int(MochiReq, DefaultFun,
-                    UrlHandlers, DbUrlHandlers, DesignUrlHandlers);
-        VhostTarget ->
+                UrlHandlers, DbUrlHandlers, DesignUrlHandlers);
+        _Else ->
+            % do rewrite
             redirect_to_vhost(MochiReq, DefaultFun,
                 UrlHandlers, DbUrlHandlers, DesignUrlHandlers, VhostTarget)
+        end
     end.
 
 
@@ -310,6 +325,17 @@ authenticate_request(Response, _AuthSrcs) ->
 increment_method_stats(Method) ->
     couch_stats_collector:increment({httpd_request_methods, Method}).
 
+% if so, then it will not be rewritten, but will run as a normal couchdb request.
+% normally you'd use this for _uuids _utils and a few of the others you want to keep available on vhosts. You can also use it to make databases 'global'.
+vhost_global(VhostGlobals, MochiReq) ->
+    "/" ++ Path = MochiReq:get(path),
+    Front = case partition(Path) of
+    {"", "", ""} ->
+        "/"; % Special case the root url handler
+    {FirstPart, _, _} ->
+        FirstPart
+    end,
+    [true] == [true||V <- VhostGlobals, V == Front].
 
 % Utilities
 
@@ -362,7 +388,7 @@ absolute_uri(#httpd{mochi_req=MochiReq}, Path) ->
     Host = case MochiReq:get_header_value(XHost) of
         undefined ->
             case MochiReq:get_header_value("Host") of
-                undefined ->
+                undefined ->    
                     {ok, {Address, Port}} = inet:sockname(MochiReq:get(socket)),
                     inet_parse:ntoa(Address) ++ ":" ++ integer_to_list(Port);
                 Value1 ->
@@ -468,10 +494,10 @@ verify_is_server_admin(#user_ctx{roles=Roles}) ->
     false -> throw({unauthorized, <<"You are not a server admin.">>})
     end.
 
-log_request(#httpd{mochi_req=MochiReq,peer=Peer,method=Method}, Code) ->
+log_request(#httpd{mochi_req=MochiReq,peer=Peer}, Code) ->
     ?LOG_INFO("~s - - ~p ~s ~B", [
         Peer,
-        Method,
+        couch_util:to_existing_atom(MochiReq:get(method)),
         MochiReq:get(raw_path),
         couch_util:to_integer(Code)
     ]).
@@ -592,11 +618,11 @@ start_jsonp(Req) ->
             try
                 % make sure jsonp is configured on (default off)
                 case couch_config:get("httpd", "allow_jsonp", "false") of
-                "true" ->
+                "true" -> 
                     validate_callback(CallBack),
                     CallBack ++ "(";
-                _Else ->
-                    % this could throw an error message, but instead we just ignore the
+                _Else -> 
+                    % this could throw an error message, but instead we just ignore the 
                     % jsonp parameter
                     % throw({bad_request, <<"JSONP must be configured before using.">>})
                     put(jsonp, no_jsonp),
@@ -754,22 +780,24 @@ parse_multipart_request(ContentType, DataFun, Callback) ->
             buffer= <<>>,
             data_fun=DataFun,
             callback=Callback},
-    {Mp2, _NilCallback} = read_until(Mp, <<"--", Boundary0/binary>>,
+    {Mp2, _NilCallback} = read_until(Mp, <<"--", Boundary0/binary>>, 
         fun(Next)-> nil_callback(Next) end),
-    #mp{buffer=Buffer, data_fun=DataFun2, callback=Callback2} =
+    #mp{buffer=Buffer, data_fun=DataFun2, callback=Callback2} = 
             parse_part_header(Mp2),
     {Buffer, DataFun2, Callback2}.
 
 nil_callback(_Data)->
     fun(Next) -> nil_callback(Next) end.
 
-get_boundary(ContentType) ->
-    {"multipart/" ++ _, Opts} = mochiweb_util:parse_header(ContentType),
+get_boundary({"multipart/" ++ _, Opts}) ->
     case proplists:get_value("boundary", Opts) of
         S when is_list(S) ->
             S
-    end.
-
+    end;
+get_boundary(ContentType) ->
+    {"multipart/" ++ _ , Opts} = mochiweb_util:parse_header(ContentType),
+    get_boundary({"multipart/", Opts}).
+    
 
 
 split_header(<<>>) ->

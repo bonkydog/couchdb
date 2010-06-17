@@ -29,11 +29,11 @@ convert_stub(#att{data=stub, name=Name} = Attachment,
     Attachment#att{data=RcvFun}.
 
 cleanup() ->
-    receive
+    receive 
     {ibrowse_async_response, _, _} ->
         %% TODO maybe log, didn't expect to have data here
         cleanup();
-    {ibrowse_async_response_end, _} ->
+    {ibrowse_async_response_end, _} -> 
         cleanup();
     {ibrowse_async_headers, _, _, _} ->
         cleanup()
@@ -54,7 +54,7 @@ attachment_receiver(Ref, Request) ->
         receive_data(Ref, ReqId, ContentEncoding)
     end
     catch
-    throw:{attachment_request_failed, timeout} ->
+    throw:{attachment_request_failed, _} ->
         case {Request#http_db.retries, Request#http_db.pause} of
         {0, _} ->
              ?LOG_INFO("request for ~p failed", [Request#http_db.resource]),
@@ -79,11 +79,7 @@ receive_data(Ref, ReqId, ContentEncoding) ->
         throw({attachment_request_failed, Err});
     {ibrowse_async_response, ReqId, Data} ->
         % ?LOG_DEBUG("got ~p bytes for ~p", [size(Data), ReqId]),
-        if ContentEncoding =:= "gzip" ->
-            zlib:gunzip(Data);
-        true ->
-            Data
-        end;
+        Data;
     {ibrowse_async_response_end, ReqId} ->
         ?LOG_ERROR("streaming att. ended but more data requested ~p", [ReqId]),
         throw({attachment_request_failed, premature_end})

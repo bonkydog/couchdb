@@ -77,7 +77,7 @@ json_req_obj(#httpd{mochi_req=Req,
         {<<"id">>, DocId},
         {<<"method">>, Method},
         {<<"path">>, Path},
-        {<<"query">>, to_json_terms(Req:parse_qs())},
+        {<<"query">>, json_query_keys(to_json_terms(Req:parse_qs()))},
         {<<"headers">>, to_json_terms(Hlist)},
         {<<"body">>, Body},
         {<<"peer">>, ?l2b(Req:get(peer))},
@@ -94,6 +94,19 @@ to_json_terms([{Key, Value} | Rest], Acc) when is_atom(Key) ->
     to_json_terms(Rest, [{list_to_binary(atom_to_list(Key)), list_to_binary(Value)} | Acc]);
 to_json_terms([{Key, Value} | Rest], Acc) ->
     to_json_terms(Rest, [{list_to_binary(Key), list_to_binary(Value)} | Acc]).
+
+json_query_keys({Json}) ->
+    json_query_keys(Json, []).
+json_query_keys([], Acc) ->
+    {lists:reverse(Acc)};
+json_query_keys([{<<"startkey">>, Value} | Rest], Acc) ->
+    json_query_keys(Rest, [{<<"startkey">>, couch_util:json_decode(Value)}|Acc]);
+json_query_keys([{<<"endkey">>, Value} | Rest], Acc) ->
+    json_query_keys(Rest, [{<<"endkey">>, couch_util:json_decode(Value)}|Acc]);
+json_query_keys([{<<"key">>, Value} | Rest], Acc) ->
+    json_query_keys(Rest, [{<<"key">>, couch_util:json_decode(Value)}|Acc]);
+json_query_keys([Term | Rest], Acc) ->
+    json_query_keys(Rest, [Term|Acc]).
 
 send_external_response(#httpd{mochi_req=MochiReq}=Req, Response) ->
     #extern_resp_args{
@@ -124,7 +137,7 @@ parse_external_response({Response}) ->
                 Args#extern_resp_args{data=Value, ctype="text/html; charset=utf-8"};
             {<<"base64">>, Value} ->
                 Args#extern_resp_args{
-                    data=couch_util:decodeBase64(Value),
+                    data=base64:decode(Value),
                     ctype="application/binary"
                 };
             {<<"headers">>, {Headers}} ->

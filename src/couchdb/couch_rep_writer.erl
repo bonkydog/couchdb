@@ -51,8 +51,27 @@ writer_loop(Parent, Reader, Target) ->
         writer_loop(Parent, Reader, Target)
     end.
 
-write_docs(#http_db{headers = Headers} = Db, Docs) ->
-    JsonDocs = [couch_doc:to_json_obj(Doc, [revs,attachments]) || Doc <- Docs],
+write_docs(#http_db{} = Db, Docs) ->
+    {DocsAtts, DocsNoAtts} = lists:partition(
+        fun(#doc{atts=[]}) -> false; (_) -> true end,
+        Docs
+    ),
+    ErrorsJson0 = write_bulk_docs(Db, DocsNoAtts),
+    ErrorsJson = lists:foldl(
+       fun(Doc, Acc) -> write_multi_part_doc(Db, Doc) ++ Acc end,
+       ErrorsJson0,
+       DocsAtts
+    ),
+    {ok, ErrorsJson};
+write_docs(Db, Docs) ->
+    couch_db:update_docs(Db, Docs, [delay_commit], replicated_changes).
+
+write_bulk_docs(_Db, []) ->
+    [];
+write_bulk_docs(#http_db{headers = Headers} = Db, Docs) ->
+    JsonDocs = [
+        couch_doc:to_json_obj(Doc, [revs, att_gzip_length]) || Doc <- Docs
+    ],
     Request = Db#http_db{
         resource = "_bulk_docs",
         method = post,
@@ -65,10 +84,83 @@ write_docs(#http_db{headers = Headers} = Db, Docs) ->
     List when is_list(List) ->
         List
     end,
-    ErrorsList = [write_docs_1(V) || V <- ErrorsJson],
-    {ok, ErrorsList};
-write_docs(Db, Docs) ->
-    couch_db:update_docs(Db, Docs, [delay_commit], replicated_changes).
+    [write_docs_1(V) || V <- ErrorsJson].
+
+write_multi_part_doc(#http_db{headers=Headers} = Db, #doc{atts=Atts} = Doc) ->
+    JsonBytes = ?JSON_ENCODE(
+        couch_doc:to_json_obj(
+            Doc,
+            [follows, att_encoding_info, attachments]
+        )
+    ),
+    Boundary = couch_uuids:random(),
+    {ContentType, Len} = couch_doc:len_doc_to_multi_part_stream(
+        Boundary, JsonBytes, Atts, true
+    ),
+    StreamerPid = spawn_link(
+        fun() -> streamer_fun(Boundary, JsonBytes, Atts) end
+    ),
+    BodyFun = fun(Acc) ->
+        DataQueue = case Acc of
+        nil ->
+            StreamerPid ! {start, self()},
+            receive
+            {queue, Q} ->
+                Q
+            end;
+        Queue ->
+            Queue
+        end,
+        case couch_work_queue:dequeue(DataQueue) of
+        closed ->
+            eof;
+        {ok, Data} ->
+            {ok, iolist_to_binary(Data), DataQueue}
+        end
+    end,
+    Request = Db#http_db{
+        resource = couch_util:url_encode(Doc#doc.id),
+        method = put,
+        qs = [{new_edits, false}],
+        body = {BodyFun, nil},
+        headers = [
+            {"x-couch-full-commit", "false"},
+            {"Content-Type", ?b2l(ContentType)},
+            {"Content-Length", Len} | Headers
+        ]
+    },
+    Result = case couch_rep_httpc:request(Request) of
+    {[{<<"error">>, Error}, {<<"reason">>, Reason}]} ->
+        {Pos, [RevId | _]} = Doc#doc.revs,
+        ErrId = couch_util:to_existing_atom(Error),
+        [{Doc#doc.id, couch_doc:rev_to_str({Pos, RevId})}, {ErrId, Reason}];
+    _ ->
+        []
+    end,
+    StreamerPid ! stop,
+    Result.
+
+streamer_fun(Boundary, JsonBytes, Atts) ->
+    receive
+    stop ->
+        ok;
+    {start, From} ->
+        % better use a brand new queue, to ensure there's no garbage from
+        % a previous (failed) iteration
+        {ok, DataQueue} = couch_work_queue:new(1024 * 1024, 1000),
+        From ! {queue, DataQueue},
+        couch_doc:doc_to_multi_part_stream(
+            Boundary,
+            JsonBytes,
+            Atts,
+            fun(Data) ->
+                couch_work_queue:queue(DataQueue, Data)
+            end,
+            true
+        ),
+        couch_work_queue:close(DataQueue),
+        streamer_fun(Boundary, JsonBytes, Atts)
+    end.
 
 write_docs_1({Props}) ->
     Id = proplists:get_value(<<"id">>, Props),

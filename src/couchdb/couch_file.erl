@@ -88,7 +88,7 @@ append_binary(Fd, Bin) ->
     
 append_binary_md5(Fd, Bin) ->
     Size = iolist_size(Bin),
-    gen_server:call(Fd, {append_bin,
+    gen_server:call(Fd, {append_bin, 
             [<<1:1/integer,Size:31/integer>>, erlang:md5(Bin), Bin]}, infinity).
 
 
@@ -127,11 +127,11 @@ pread_iolist(Fd, Pos) ->
         case erlang:md5(IoList) of
         Md5 -> ok;
         _ ->  throw(file_corruption)
-        end,
+        end, 
         {ok, IoList};
     <<0:1/integer,Len:31/integer>> ->
         {ok, Iolist, _} = read_raw_iolist(Fd, NextPos, Len),
-        {ok, Iolist}
+        {ok, Iolist} 
     end.
        
 
@@ -305,7 +305,7 @@ handle_call({write_header, Bin}, _From, #file{fd=Fd}=File) ->
     BlockOffset ->
         Padding = <<0:(8*(?SIZE_BLOCK-BlockOffset))>>
     end,
-    FinalBin = [Padding, <<1, BinSize:32/integer>> | make_blocks(1, [Bin])],
+    FinalBin = [Padding, <<1, BinSize:32/integer>> | make_blocks(5, [Bin])],
     {reply, file:pwrite(Fd, Pos, FinalBin), File};
 
 

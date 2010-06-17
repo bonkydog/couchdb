@@ -28,18 +28,23 @@
 
 -define(LOG_DEBUG(Format, Args),
     case couch_log:debug_on() of
-        true -> error_logger:info_report(couch_debug, {Format, Args});
+        true ->
+            gen_event:sync_notify(error_logger,
+                {self(), couch_debug, {Format, Args}});
         false -> ok
     end).
 
 -define(LOG_INFO(Format, Args),
     case couch_log:info_on() of
-        true -> error_logger:info_report(couch_info, {Format, Args});
+        true ->
+            gen_event:sync_notify(error_logger,
+                {self(), couch_info, {Format, Args}});
         false -> ok
     end).
 
 -define(LOG_ERROR(Format, Args),
-    error_logger:error_report(couch_error, {Format, Args})).
+    gen_event:sync_notify(error_logger,
+            {self(), couch_error, {Format, Args}})).
 
 
 -record(rev_info,
@@ -102,12 +107,16 @@
     name,
     type,
     att_len,
-    disk_len, % length of the attachment in uncompressed form
-              % differs from at_len when comp =:= true
+    disk_len, % length of the attachment in its identity form
+              % (that is, without a content encoding applied to it)
+              % differs from att_len when encoding /= identity
     md5= <<>>,
     revpos=0,
     data,
-    comp=false  % gzip compression Y/N
+    encoding=identity % currently supported values are:
+                      %     identity, gzip
+                      % additional values to support in the future:
+                      %     deflate, compress
     }).
 
 
@@ -276,3 +285,4 @@
     filter = "",
     include_docs = false
 }).
+
