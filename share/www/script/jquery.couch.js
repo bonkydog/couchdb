@@ -230,6 +230,51 @@
             "Database information could not be retrieved"
           );
         },
+        changes: function(since, options) {
+          options = {} || options;
+          // set up the promise object within a closure for this handler
+          var db = this, active = true, listeners = [], promise = {
+            onChange : function(fun) {
+              listeners.push(fun);
+            },
+            stop : function() {
+              active = false;
+            }
+          };
+          // call each listener when there is a change
+          function triggerListeners(resp) {
+            $.each(listeners, function() {
+              this(resp);
+            });
+          };
+          // when there is a change, call any listeners, then check for another change
+          options.success = function(resp) {
+            if (active) {
+              var seq = resp.last_seq;
+              triggerListeners(resp);
+              getChangesSince(seq);
+            };
+          };
+          // actually make the changes request
+          function getChangesSince(seq) {
+            ajax(
+              {url: db.uri + "_changes?feed=longpoll&since="+seq},
+              options,
+              "Error connecting to "+db.uri+"/_changes."
+            );
+          }
+          // start the first request
+          if (since) {
+            getChangesSince(since);
+          } else {
+            db.info({
+              success : function(info) {
+                getChangesSince(info.update_seq);
+              }
+            });
+          }
+          return promise;
+        },
         allDocs: function(options) {
           var type = "GET";
           var data = null;
@@ -502,11 +547,14 @@
       );
     },
 
-    replicate: function(source, target, ajaxOptions, replicationOptions) {
-      replicationOptions = $.extend({source: source, target: target}, replicationOptions);
+    replicate: function(source, target, ajaxOptions, repOpts) {
+      $.extend(repOpts, {source: source, target: target});
+      if (repOpts.continuous) {
+        ajaxOptions.successStatus = 202;
+      }
       ajax({
           type: "POST", url: this.urlPrefix + "/_replicate",
-          data: JSON.stringify(replicationOptions),
+          data: JSON.stringify(repOpts),
           contentType: "application/json"
         },
         ajaxOptions,
@@ -534,9 +582,8 @@
   function ajax(obj, options, errorMessage, ajaxOptions) {
     options = $.extend({successStatus: 200}, options);
     errorMessage = errorMessage || "Unknown error";
-
     $.ajax($.extend($.extend({
-      type: "GET", dataType: "json",
+      type: "GET", dataType: "json", cache : !$.browser.msie,
       beforeSend: function(xhr){
         if(ajaxOptions && ajaxOptions.headers){
           for (var header in ajaxOptions.headers){

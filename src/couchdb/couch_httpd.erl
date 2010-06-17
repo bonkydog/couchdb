@@ -495,10 +495,10 @@ verify_is_server_admin(#user_ctx{roles=Roles}) ->
     false -> throw({unauthorized, <<"You are not a server admin.">>})
     end.
 
-log_request(#httpd{mochi_req=MochiReq,peer=Peer,method=Method}, Code) ->
+log_request(#httpd{mochi_req=MochiReq,peer=Peer}, Code) ->
     ?LOG_INFO("~s - - ~p ~s ~B", [
         Peer,
-        Method,
+        couch_util:to_existing_atom(MochiReq:get(method)),
         MochiReq:get(raw_path),
         couch_util:to_integer(Code)
     ]).
@@ -816,6 +816,11 @@ read_until(#mp{data_fun=DataFun, buffer=Buffer}=Mp, Pattern, Callback) ->
         {Buffer2, DataFun2} = DataFun(),
         Buffer3 = iolist_to_binary(Buffer2),
         read_until(Mp#mp{data_fun=DataFun2,buffer=Buffer3}, Pattern, Callback2);
+    {partial, 0} ->
+        {NewData, DataFun2} = DataFun(),
+        read_until(Mp#mp{data_fun=DataFun2,
+                buffer= iolist_to_binary([Buffer,NewData])},
+                Pattern, Callback);
     {partial, Skip} ->
         <<DataChunk:Skip/binary, Rest/binary>> = Buffer,
         Callback2 = Callback(DataChunk),
@@ -823,6 +828,10 @@ read_until(#mp{data_fun=DataFun, buffer=Buffer}=Mp, Pattern, Callback) ->
         read_until(Mp#mp{data_fun=DataFun2,
                 buffer= iolist_to_binary([Rest | NewData])},
                 Pattern, Callback2);
+    {exact, 0} ->
+        PatternLen = size(Pattern),
+        <<_:PatternLen/binary, Rest/binary>> = Buffer,
+        {Mp#mp{buffer= Rest}, Callback};
     {exact, Skip} ->
         PatternLen = size(Pattern),
         <<DataChunk:Skip/binary, _:PatternLen/binary, Rest/binary>> = Buffer,
