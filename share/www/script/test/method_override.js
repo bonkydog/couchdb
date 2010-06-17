@@ -10,7 +10,8 @@
 // License for the specific language governing permissions and limitations under
 // the License.
 
-// Allow broken HTTP clients to fake a full method vocabulary with an X-HTTP-METHOD-OVERRIDE header
+// Allow broken HTTP clients to fake a full method vocabulary with an
+// X-HTTP-METHOD-OVERRIDE header
 couchTests.method_override = function(debug) {
   var result = JSON.parse(CouchDB.request("GET", "/").responseText);
   T(result.couchdb == "Welcome");
@@ -21,13 +22,19 @@ couchTests.method_override = function(debug) {
   db.createDb();
   
   var doc = {bob : "connie"};
-  xhr = CouchDB.request("POST", "/test_suite_db/fnord", {body: JSON.stringify(doc), headers:{"Method-Override" : "PUT"}});
+  xhr = CouchDB.request("POST", "/test_suite_db/fnord", {
+      headers:{"Method-Override" : "PUT"},
+      body: JSON.stringify(doc)
+  });
   T(xhr.status == 201);
   
   doc = db.open("fnord");
   T(doc.bob == "connie");
 
-  xhr = CouchDB.request("POST", "/test_suite_db/fnord?rev=" + doc._rev, {headers:{"Method-Override" : "DELETE"}});
+  xhr = CouchDB.request("POST", "/test_suite_db/fnord?rev=" + doc._rev, {      
+    headers:{"Method-Override" : "DELETE"}
+  });
+  
   T(xhr.status == 200)
   
   doc = db.open("fnord");
